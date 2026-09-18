@@ -1,0 +1,20 @@
+models:
+  qwen3.8-flash-next-exl3:
+    name: "Qwen3.8 Flash-Next EXL3 4.05bpw"
+    description: "64K context; reasoning budget 1024; Q4 KV; MTP 3; text/code/tools"
+    proxy: "http://127.0.0.1:${PORT}"
+    ttl: 0
+    unloadTimeout: 15
+    concurrencyLimit: 1
+    capabilities:
+      in: [text]
+      out: [text]
+      tools: true
+      context: 65536
+    cmd: >-
+      powershell.exe -NoProfile -ExecutionPolicy Bypass
+      -File "<REPOSITORY_ROOT>\scripts\start-server.ps1"
+      -TabbyApiRoot "<TABBY_API_ROOT>"
+      -ExllamaRoot "<PATCHED_EXLLAMAV3_ROOT>"
+      -ModelRoot "<MODEL_ROOT>"
+      -Port ${PORT}

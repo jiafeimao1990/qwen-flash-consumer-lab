@@ -1,0 +1,33 @@
+{
+  "timestamp_local": "2026-09-18T21:17:10+08:00",
+  "model": "Qwen3.8-Flash-Next-EXL3-4.05bpw",
+  "route": "DeepSeek Harness headless -> llama-swap :1234 -> TabbyAPI dynamic port :12353",
+  "configuration": {
+    "context_tokens": 65536,
+    "kv_cache": "Q4",
+    "gpu_split_gib": [14.5, 14.5],
+    "gpu_experts_per_layer": 156,
+    "cpu_experts_per_layer": 356,
+    "mtp_draft_tokens": 3,
+    "thinking_enabled": true,
+    "reasoning_budget_tokens": 1024,
+    "tool_format": "qwen3_coder"
+  },
+  "result": {
+    "exit_code": 0,
+    "elapsed_s": 131.39,
+    "assistant_turns": 4,
+    "parsed_tool_calls": 4,
+    "files_created": ["task_tracker.py", "test_task_tracker.py"],
+    "tests_run": 10,
+    "tests_passed": 10,
+    "manual_intervention": false
+  },
+  "turns": [
+    {"prompt_tokens": 8037, "cache_pct": 0, "new_prompt_tokens": 8037, "prefill_tok_s": 721, "generated_tokens": 3353, "decode_tok_s": 40.2, "first_token_s": 11.2, "mtp_accept_pct": 84, "tool_calls": 2},
+    {"prompt_tokens": 11528, "cache_pct": 71, "new_prompt_tokens": 3336, "prefill_tok_s": 398, "generated_tokens": 131, "decode_tok_s": 40.4, "first_token_s": 8.40, "mtp_accept_pct": 89, "tool_calls": 1},
+    {"prompt_tokens": 11933, "cache_pct": 97, "new_prompt_tokens": 413, "prefill_tok_s": 132, "generated_tokens": 223, "decode_tok_s": 38.3, "first_token_s": 3.14, "mtp_accept_pct": 78, "tool_calls": 1},
+    {"prompt_tokens": 12222, "cache_pct": 96, "new_prompt_tokens": 446, "prefill_tok_s": 163, "generated_tokens": 358, "decode_tok_s": 39.4, "first_token_s": 2.74, "mtp_accept_pct": 68, "tool_calls": 0}
+  ],
+  "quality": "All acceptance criteria met. Independent unittest run passed 10/10. Code stayed inside the isolated workspace."
+}

@@ -1,0 +1,29 @@
+agent-default-model:
+  provider: flash-exl3-swap
+  model: qwen3.8-flash-next-exl3
+  reasoningEffort: medium
+
+llm-pi-ai:
+  providers:
+    flash-exl3-swap:
+      displayName: Local Flash EXL3 64K
+      apiKeyEnv: LOCAL_LLM_API_KEY
+      api: openai-completions
+      baseURL: http://127.0.0.1:1234/v1
+      reasoning: medium
+      timeoutMs: 900000
+      streamIdleTimeoutMs: 600000
+      compat:
+        supportsDeveloperRole: false
+        maxTokensField: max_tokens
+        thinkingFormat: chat-template
+        chatTemplateKwargs:
+          enable_thinking: true
+      models:
+        - id: qwen3.8-flash-next-exl3
+          name: Qwen3.8 Flash-Next EXL3 4.05bpw (64K / thinking 1024)
+          contextWindow: 65536
+          maxTokens: 4096
+          input: [text]
+          reasoningEfforts:
+            medium: medium

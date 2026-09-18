@@ -1,0 +1,798 @@
+diff --git a/exllamav3/ext.py b/exllamav3/ext.py
+index a6c6347..7c4cf8a 100644
+--- a/exllamav3/ext.py
++++ b/exllamav3/ext.py
+@@ -29,7 +29,6 @@ def is_precompiled_extension_available():
+ if is_precompiled_extension_available():
+     import exllamav3_ext
+ else:
+-
+     # Kludge to get compilation working on Windows
+ 
+     if windows:
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index 45042ef..060c854 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -575,6 +575,8 @@ class Generator:
+         # Dynamic expert placement: apply any pending swap sweep now, between generations —
+         # a placement change perturbs the logits slightly (same expert, different device
+         # numerics) and must never land mid-stream
++        from ..modules.moe_trace import flush_moe_trace
++        flush_moe_trace(self.model.config.infer_params)
+         from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
+         run_pending_swap_sweeps(self.model.config.infer_params)
+         malloc_trim()
+diff --git a/exllamav3/model/model_ls.py b/exllamav3/model/model_ls.py
+index 94f05c0..a5ca889 100644
+--- a/exllamav3/model/model_ls.py
++++ b/exllamav3/model/model_ls.py
+@@ -251,6 +251,12 @@ class Model_LSMixin(ABC):
+ 
+                     # We're not good
+                     except Exception as e:
++                        if os.environ.get("EXL3_AUTOSPLIT_DEBUG"):
++                            print(
++                                f" !! autosplit load failure for {module.key} on cuda:{current_device_i}: "
++                                f"{type(e).__name__}: {e}",
++                                flush = True,
++                            )
+                         config.stc.abort_deferred_load()
+                         if e.__class__.__name__ == "OutOfMemoryError" or \
+                             "CUDA out of memory" in str(e) or \
+diff --git a/exllamav3/model/moe_cpu_host.py b/exllamav3/model/moe_cpu_host.py
+index 11cf1ca..0353d9f 100644
+--- a/exllamav3/model/moe_cpu_host.py
++++ b/exllamav3/model/moe_cpu_host.py
+@@ -1172,6 +1172,127 @@ class MoeCpuHost:
+         if msg[0] != "ok":
+             raise RuntimeError(f"CPU MoE worker expert install failed: {msg[1] if len(msg) > 1 else msg}")
+ 
++    def prefetch_decode_expert(self, layer_idx, local_idx, router_id, device):
++        """Stage one CPU-resident expert and start its H2D copy before the target layer.
++
++        This is an opt-in decode canary. The returned handle owns a normal streamed-weight
++        ring slot until consume_prefetched_decode records its consumed event. No model weights
++        or placement maps are mutated.
++        """
++        spec = self.specs[layer_idx]
++        exp_b = spec.get("expert_bytes")
++        if exp_b is None or exp_b > self.wslot_size or layer_idx not in self.aux:
++            return None
++        with torch.cuda.device(device):
++            st = self._ensure_stream_state(device)
++            ws = self.next_wslot
++            self.next_wslot = (self.next_wslot + 1) % self.num_wslots
++            self.wseq += 1
++            seq = self.wseq
++            stail = int(self.v_stage_tail[0])
++            if stail - int(self.v_stage_head[0]) >= MOE_STAGE_RING - 2:
++                return None
++            job = self.v_stage_jobs[stail % MOE_STAGE_RING]
++            job[0] = seq
++            job[1] = layer_idx
++            job[2] = 1
++            job[3] = 0
++            job[4] = ws
++            job[5] = 1
++            job[6] = self.wslot_prev_seq[ws]
++            job[7] = int(local_idx)
++            self.v_stage_tail[0] = stail + 1
++            self.wslot_prev_seq[ws] = seq
++
++            copy_stream = st["copy_stream"]
++            with torch.cuda.stream(copy_stream):
++                if st["wslot_used"][ws]:
++                    copy_stream.wait_event(st["wconsumed_ev"][ws])
++                ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, self.gpu_base_ptr + 128)
++                st["vram_slots"][ws][:exp_b // 2].copy_(
++                    self.wviews[ws][:exp_b // 2], non_blocking = True)
++                ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
++                pd = spec["proj_dims"]
++                gb, ub, _ = spec["proj_bytes"]
++                if st["swz"]:
++                    for name, off in (("g", 0), ("u", gb), ("d", gb + ub)):
++                        if not pd.get(name):
++                            continue
++                        k, n, K = pd[name]
++                        ext.moe_unswizzle_trellis(
++                            st["vram_slots"][ws], st["native_slots"][ws], 1, exp_b, off,
++                            k // 16, n // 16, K, K != 8)
++                st["wready_ev"][ws].record(copy_stream)
++            st["wslot_used"][ws] = True
++            return {
++                "layer_idx": layer_idx,
++                "local_idx": int(local_idx),
++                "router_id": int(router_id),
++                "ws": ws,
++                "state": st,
++            }
++
++    def consume_prefetched_decode(self, handle, y, sel_cpu, routing_weights):
++        """Compute one prefetched CPU expert on the GPU and mask its CPU assignments.
++
++        The fused kernel intentionally receives all decode assignments for a single expert;
++        nonmatching assignments carry zero routing weight. This avoids a host-visible nonzero
++        count and keeps the canary free of an additional GPU->CPU synchronization.
++        """
++        if handle is None:
++            return None, sel_cpu
++        layer_idx = handle["layer_idx"]
++        local_idx = handle["local_idx"]
++        ws = handle["ws"]
++        st = handle["state"]
++        spec = self.specs[layer_idx]
++        aux = self.aux[layer_idx]
++        rows, h = y.shape
++        topk = sel_cpu.shape[-1]
++        assignments = sel_cpu.numel()
++        with torch.cuda.device(y.device):
++            torch.cuda.current_stream().wait_event(st["wready_ev"][ws])
++            vslot = st["native_slots"][ws] if st["swz"] else st["vram_slots"][ws]
++            pd = spec["proj_dims"]
++            gb, ub, _ = spec["proj_bytes"]
++            gated = pd.get("g") is not None
++            base = vslot.data_ptr()
++            ptrs = [0] * 9
++            if gated:
++                ptrs[0] = base
++                ptrs[1] = aux["suh_g"][local_idx].data_ptr()
++                ptrs[2] = aux["svh_g"][local_idx].data_ptr()
++            ptrs[3] = base + gb
++            ptrs[4] = aux["suh_u"][local_idx].data_ptr()
++            ptrs[5] = aux["svh_u"][local_idx].data_ptr()
++            ptrs[6] = base + gb + ub
++            ptrs[7] = aux["suh_d"][local_idx].data_ptr()
++            ptrs[8] = aux["svh_d"][local_idx].data_ptr()
++            if not gated:
++                ptrs[0:3] = ptrs[3:6]
++            tbl = torch.tensor(ptrs, dtype = torch.int64, device = y.device).view(9, 1)
++            counts = torch.tensor([assignments, 0], dtype = torch.long, device = y.device)
++            token_idx = torch.arange(assignments, dtype = torch.long, device = y.device) // topk
++            hit_mask = sel_cpu.reshape(-1) == local_idx
++            weights = routing_weights.reshape(-1).half() * hit_mask
++            out = torch.zeros((rows, h), dtype = torch.float, device = y.device)
++            fbufs = self._stream_fused_bufs(st, spec, y.device)
++            Kg = pd["g"][2] if gated else pd["u"][2]
++            Ku, Kd = pd["u"][2], pd["d"][2]
++            mt = 16 if assignments <= 16 else (32 if assignments <= 32 else 64)
++            ext.exl3_moe(
++                y, out, counts, token_idx, weights,
++                fbufs[0], fbufs[1], fbufs[2], fbufs[3],
++                spec["activation"], Kg, Ku, Kd,
++                tbl[0], tbl[1], tbl[2], tbl[3], tbl[4], tbl[5],
++                tbl[6], tbl[7], tbl[8],
++                False, True, False, True, False, True,
++                float(spec["act_limit"] or 0.0), 1, None, None, 1, assignments, mt,
++            )
++            st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
++            sel_cpu = sel_cpu.masked_fill(sel_cpu == local_idx, -1)
++            return out, sel_cpu
++
+     def submit_prefill(self, layer_idx, y, selected_experts, routing_weights):
+         """
+         Split the routed-expert workload by per-expert token count: hot experts (count >=
+diff --git a/exllamav3/modules/block_sparse_mlp.py b/exllamav3/modules/block_sparse_mlp.py
+index c461a99..975e2c1 100644
+--- a/exllamav3/modules/block_sparse_mlp.py
++++ b/exllamav3/modules/block_sparse_mlp.py
+@@ -981,6 +981,35 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+         if self.cpu_split_first is not None and not params.get("autosplit_measure"):
+             cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
+ 
++        # Experimental same-layer peer shard. Launch its fused expert kernel immediately
++        # after routing; CUDA on the remote device can then overlap with this layer's local
++        # GPU expert work and the CPU partial. Only decode/MTP-sized batches use the canary
++        # path for now. Cross-device copies go through the engine's verified copy helper.
++        peer_partial = None
++        peer = getattr(self, "_peer_shard", None)
++        if peer is not None and bsz <= MAX_BSZN and not params.get("autosplit_measure"):
++            # Most small peer shards are not selected on a given token. Paying three
++            # transfers and a fused launch for an all-masked shard is much more expensive
++            # than the tiny router-result readback on this Windows dual-GPU platform.
++            lo, hi = peer.routing_first, peer.routing_last
++            peer_hit = bool(((selected_experts >= lo) & (selected_experts < hi)).any().item())
++            if peer_hit:
++                source_stream = torch.cuda.current_stream(y.device)
++                peer._peer_source_ready.record(source_stream)
++                with torch.cuda.stream(peer._peer_stream):
++                    peer._peer_stream.wait_event(peer._peer_source_ready)
++                    py = peer._peer_y[:bsz]
++                    ps = peer._peer_selected[:bsz]
++                    pw = peer._peer_weights[:bsz]
++                    py.copy_(y, non_blocking = True)
++                    ps.copy_(selected_experts, non_blocking = True)
++                    pw.copy_(routing_weights, non_blocking = True)
++                    peer.bc.run_bszN(py, ps, pw)
++                    po = peer.experts_cfg.out_bszn[:bsz].view(eshape)
++                    peer_partial = peer._peer_return[:bsz].view(eshape)
++                    peer_partial.copy_(po, non_blocking = True)
++                    peer._peer_done.record(peer._peer_stream)
++
+         if self.cpu_offload:
+             final_hidden_states = self.cpu_offload_forward(eshape, y, selected_experts, routing_weights, params)
+ 
+@@ -1263,6 +1292,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+         # CPU tail partial folds in before the post norms (nonlinear: they must see the
+         # complete routed sum)
+         final_hidden_states = self.cpu_split_combine(final_hidden_states, cpu_partial, cpu_pending, eshape)
++        if peer_partial is not None:
++            torch.cuda.current_stream(final_hidden_states.device).wait_event(peer._peer_done)
++            final_hidden_states.add_(peer_partial)
+ 
+         # Latent MoE: project the routed sum back to the residual width (linear, so under TP
+         # each rank's partial sum projects on its own ahead of the reduction)
+diff --git a/exllamav3/modules/block_sparse_mlp_cpu.py b/exllamav3/modules/block_sparse_mlp_cpu.py
+index 73d14dc..72bca20 100644
+--- a/exllamav3/modules/block_sparse_mlp_cpu.py
++++ b/exllamav3/modules/block_sparse_mlp_cpu.py
+@@ -3,6 +3,7 @@ from typing_extensions import override
+ import os
+ import torch
+ from ..ext import exllamav3_ext as ext
++from .moe_trace import init_moe_trace, record_moe_trace
+ 
+ # Kernel-fused issue/collect for decode-size split jobs (EXL3_MOE_SPLIT_FUSED=0 restores the
+ # cudaMemcpyAsync path for A/B testing)
+@@ -76,11 +77,15 @@ def run_pending_swap_sweeps(infer_params):
+             assert int(h.v_jobs_head[0]) == int(h.v_jobs_tail[0]), \
+                 "swap sweep: job ring not drained after all-device sync"
+     budget = int(os.environ.get("EXL3_MOE_CPU_SWAP_MAX", 64))
++    per_layer = max(1, int(os.environ.get("EXL3_MOE_CPU_SWAP_PER_LAYER", 2)))
+     total = 0
+     for m in reg:
+         if budget <= 0:
+             break
+-        n = m._split_sweep_layer(budget)
++        # A single early layer can expose hundreds of candidates and used to consume the
++        # entire global budget, starving every later layer. Bound each layer's share so a
++        # sweep can adapt the whole network. The global limit still bounds checkpoint I/O.
++        n = m._split_sweep_layer(min(budget, per_layer))
+         budget -= n
+         total += n
+     if total and os.environ.get("EXL3_MOE_CPU_SWAP_DEBUG"):
+@@ -93,6 +98,10 @@ class BlockSparseMLP_CPU:
+         self.cpu_offload = False
+         self.cpu_split_first = None   # split offload: first CPU-resident (tail) expert index
+         self._split_map = None        # dynamic placement: router id -> physical slot
++        self._peer_shard = None       # optional same-layer expert shard on the other GPU
++        self._prefetch_next = None
++        self._prefetch_table = None
++        self._pending_prefetch = None
+ 
+     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
+         """Whole-layer offload claim: when the budget allows and the layer is eligible,
+@@ -129,6 +138,36 @@ class BlockSparseMLP_CPU:
+         # that slice. infer_params.moe_cpu_split is authoritative (the EXL3_MOE_CPU_SPLIT env
+         # is its construction-time default)
+         split_k = int(getattr(ip, "moe_cpu_split", 0))
++        if self.key.startswith("mtp."):
++            split_k = int(os.environ.get("EXL3_MOE_MTP_CPU_SPLIT", split_k))
++        # Experimental V0.3 canary: make room in the local expert slice for a small
++        # same-layer shard on the other GPU. The total number of GPU-resident experts is
++        # unchanged; only their device placement changes. An exact key match prevents an
++        # accidental all-layer rollout while the path is being validated.
++        peer_keys = {
++            k.strip() for k in os.environ.get("EXL3_MOE_PEER_LAYERS", "").split(",")
++            if k.strip()
++        }
++        peer_key = os.environ.get("EXL3_MOE_PEER_LAYER")
++        if peer_key:
++            peer_keys.add(peer_key)
++        peer_n = int(os.environ.get("EXL3_MOE_PEER_EXPERTS", 0))
++        if self.key in peer_keys and peer_n > 0:
++            # Default is additive: preserve the existing local hot set and use spare
++            # memory on the peer for the hottest experts that would otherwise be CPU-only.
++            # Rebalance mode instead keeps total GPU expert count constant and is useful
++            # only for isolating cross-device scheduling cost.
++            if os.environ.get("EXL3_MOE_PEER_REBALANCE", "0") == "1":
++                split_k += peer_n
++            self._peer_requested_count = peer_n
++        else:
++            self._peer_requested_count = 0
++        capacity_path = os.environ.get("EXL3_MOE_GPU_SLOTS_PROFILE")
++        if capacity_path and not self.key.startswith("mtp."):
++            import json
++            profiled_slots = json.load(open(capacity_path)).get(self.key)
++            if profiled_slots is not None:
++                split_k = self.num_experts - int(profiled_slots)
+         if split_k:
+             assert not getattr(ip, "moe_cpu_offload", 0) and not getattr(ip, "draft_moe_cpu_offload", 0), \
+                 "moe_cpu_split and moe_cpu_offload are mutually exclusive: the split offloads " \
+@@ -162,6 +201,20 @@ class BlockSparseMLP_CPU:
+         # into the same hot-to-cold expert order the weight lists were rearranged into.
+         # gate_tensor is (hidden, E), logits = y @ W: permute columns
+         if self.cpu_split_first is not None and self._split_perm is not None:
++            # The module can be inside the loader's deferred bracket here. TabbyAPI enables
++            # moe_cpu_split through InferParams rather than EXL3_MOE_CPU_SPLIT, so the old
++            # can_defer_load guard did not protect this router: permuting its not-yet-filled
++            # destination produced a corrupt gate and degenerate output. Read this one small
++            # dense tensor synchronously, while leaving the large expert tensors deferred.
++            rg = self.routing_gate
++            rg.inner.weight = self.config.stc.get_tensor(
++                rg.key + ".weight",
++                rg.inner.weight.device,
++                float2half = True,
++                transpose = rg.transposed_load,
++                pad_to = (rg.in_features, rg.out_features),
++                no_defer = True,
++            )
+             perm_t = torch.tensor(self._split_perm, device = self.routing_gate.inner.weight.device)
+             ig = self.routing_gate.inner
+             ig.weight = ig.weight[:, perm_t].contiguous()
+@@ -188,8 +241,69 @@ class BlockSparseMLP_CPU:
+                 reg = []
+                 ip2.moe_cpu_swap_modules = reg
+             reg.append(self)
++        if self.cpu_split_first is not None:
++            init_moe_trace(self)
++            self._init_transition_prefetch()
++
++    def _init_transition_prefetch(self):
++        """Link selected adjacent split layers for the opt-in transition-prefetch canary."""
++        path = os.environ.get("EXL3_MOE_PREFETCH_PROFILE")
++        if not path or self.key.startswith("mtp."):
++            return
++        ip = self.config.infer_params
++        profile = getattr(ip, "moe_cpu_prefetch_profile", None)
++        if profile is None:
++            import json
++            with open(path, encoding = "utf-8") as f:
++                profile = json.load(f)
++            ip.moe_cpu_prefetch_profile = profile
++            ip.moe_cpu_prefetch_modules = {}
++        modules = ip.moe_cpu_prefetch_modules
++        modules[self.key] = self
++        enabled = {
++            key.strip() for key in os.environ.get("EXL3_MOE_PREFETCH_LAYERS", "").split(",")
++            if key.strip()
++        }
++        entry = profile.get(self.key)
++        if self.key not in enabled or not entry:
++            return
++        source = modules.get(entry.get("source"))
++        if source is None or source.device != self.device or self._split_map is not None:
++            print(f" !! transition prefetch skipped for {self.key}: requires an adjacent "
++                  f"same-device source and static placement", flush = True)
++            return
++        source._prefetch_next = self
++        source._prefetch_table = torch.tensor(
++            entry["by_source"], dtype = torch.long, device = source.device)
++        print(f" -- transition prefetch canary: {source.key} -> {self.key}", flush = True)
++
++    def _schedule_transition_prefetch(self, selected_experts):
++        target = self._prefetch_next
++        table = self._prefetch_table
++        if target is None or table is None or selected_experts.shape[0] > 8:
++            return
++        flat = selected_experts.reshape(-1)
++        ranked = table.index_select(0, flat).reshape(-1)
++        width = table.shape[1]
++        scores = torch.zeros(target.num_experts, dtype = torch.float, device = self.device)
++        score_values = torch.arange(width, 0, -1, dtype = torch.float, device = self.device) \
++            .repeat(flat.numel())
++        scores.scatter_add_(0, ranked, score_values)
++        cpu_mask = torch.arange(target.num_experts, device = self.device) >= target.cpu_split_first
++        scores.masked_fill_(~cpu_mask, -1.0)
++        value, router = scores.max(dim = 0)
++        value_h, router_h = value.item(), router.item()
++        if value_h <= 0:
++            return
++        local_idx = router_h - target.cpu_split_first
++        target._pending_prefetch = target.cpu_host.prefetch_decode_expert(
++            target.cpu_layer_idx, local_idx, router_h, target.device)
+ 
+     def cpu_unload(self):
++        peer = getattr(self, "_peer_shard", None)
++        if peer is not None:
++            peer.unload()
++            self._peer_shard = None
+         if self.cpu_split_first is not None:
+             host = getattr(self, "cpu_host", None)
+             if host is not None:
+@@ -198,6 +312,8 @@ class BlockSparseMLP_CPU:
+              self.num_local_experts, self.routing_first, self.routing_last) = self._split_saved
+             self._split_saved = None
+             self.cpu_split_first = None
++            if hasattr(self, "_split_runtime_lists"):
++                del self._split_runtime_lists
+             if self._split_map is not None:
+                 reg = getattr(self.config.infer_params, "moe_cpu_swap_modules", None)
+                 if reg is not None and self in reg:
+@@ -223,6 +339,16 @@ class BlockSparseMLP_CPU:
+         big prefill batches take the single-phase streamed path, which overlaps internally.
+         Expert ids ship in the worker's local range with -1 sentinels for GPU-resident
+         picks."""
++        record_moe_trace(self, selected_experts, bsz)
++        prefetched = self._pending_prefetch
++        self._pending_prefetch = None
++        prefetch_partial = None
++        sel_cpu_prefetch = None
++        if prefetched is not None and bsz < self.cpu_host.stream_min_rows:
++            sel_cpu_prefetch = self._split_translate(selected_experts)
++            prefetch_partial, sel_cpu_prefetch = self.cpu_host.consume_prefetched_decode(
++                prefetched, y, sel_cpu_prefetch, routing_weights)
++        self._schedule_transition_prefetch(selected_experts)
+         if self._split_map is not None:
+             self._split_swap_tick()
+         if bsz < self.cpu_host.stream_min_rows:
+@@ -231,18 +357,31 @@ class BlockSparseMLP_CPU:
+             # the worker compute and the readback) when no CPU expert was selected. Replaces
+             # three cudaMemcpyAsync launches, the int32 cast and the pad per layer per step
+             if _split_fused:
++                fused_selected = selected_experts
++                if prefetch_partial is not None:
++                    # Preserve the existing fused issue path while excluding the one
++                    # expert already computed by the prefetch stream. The original router
++                    # selection remains untouched for the GPU expert path.
++                    fused_selected = selected_experts.masked_fill(
++                        selected_experts == prefetched["router_id"], -1)
+                 call = lambda: self.cpu_host.submit_issue_fused(
+-                    self.cpu_layer_idx, y, selected_experts, routing_weights,
++                    self.cpu_layer_idx, y, fused_selected, routing_weights,
+                     self._split_map,
+                     self._split_hist if self._split_map is not None else None,
+                     self.cpu_split_first)
+                 pending = _sprof_wrap("issue", self.cpu_layer_idx, call) \
+                     if _split_prof else call()
+                 if pending is not None:
++                    if prefetch_partial is not None:
++                        return None, ("prefetch", ("fused", pending), prefetch_partial)
+                     return None, ("fused", pending)
+-            sel_cpu = self._split_translate(selected_experts)
+-            return None, self.cpu_host.submit_issue(
++            sel_cpu = sel_cpu_prefetch if sel_cpu_prefetch is not None \
++                else self._split_translate(selected_experts)
++            pending = self.cpu_host.submit_issue(
+                 self.cpu_layer_idx, y, sel_cpu, routing_weights)
++            if prefetch_partial is not None:
++                pending = ("prefetch", pending, prefetch_partial)
++            return None, pending
+         sel_cpu = self._split_translate(selected_experts)
+         return self.cpu_host.submit_prefill(
+             self.cpu_layer_idx, y, sel_cpu, routing_weights), None
+@@ -253,7 +392,12 @@ class BlockSparseMLP_CPU:
+         graphs at baked addresses -- and the worker-side selection with -1 sentinels for
+         GPU-resident picks); the static split is a tail offset."""
+         if self._split_map is None:
+-            return (selected_experts - self.cpu_split_first).clamp_min(-1)
++            sel_cpu = (selected_experts - self.cpu_split_first).clamp_min(-1)
++            peer = getattr(self, "_peer_shard", None)
++            if peer is not None:
++                lo, hi = peer.routing_first, peer.routing_last
++                sel_cpu.masked_fill_((selected_experts >= lo) & (selected_experts < hi), -1)
++            return sel_cpu
+         n = selected_experts.numel()
+         buf = self._split_selcpu_t
+         if buf is None or buf.numel() < n:
+@@ -282,6 +426,9 @@ class BlockSparseMLP_CPU:
+         exactly when it is ready). Fused handles add in place straight from the pinned slot
+         (or skip the readback entirely for a job with no CPU-resident picks)."""
+         if cpu_pending is not None:
++            prefetch_partial = None
++            if isinstance(cpu_pending, tuple) and cpu_pending[0] == "prefetch":
++                _, cpu_pending, prefetch_partial = cpu_pending
+             if isinstance(cpu_pending, tuple) and cpu_pending[0] == "fused":
+                 f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])
+                 if _split_prof:
+@@ -289,10 +436,14 @@ class BlockSparseMLP_CPU:
+                                 lambda: self.cpu_host.submit_collect_fused(cpu_pending[1], f2))
+                 else:
+                     self.cpu_host.submit_collect_fused(cpu_pending[1], f2)
++                if prefetch_partial is not None:
++                    final_hidden_states.add_(prefetch_partial.view(shape))
+                 return final_hidden_states
+             cpu_partial = self.cpu_host.submit_collect(cpu_pending)
+         if cpu_partial is not None:
+             final_hidden_states = final_hidden_states + cpu_partial.view(shape)
++        if 'prefetch_partial' in locals() and prefetch_partial is not None:
++            final_hidden_states = final_hidden_states + prefetch_partial.view(shape)
+         return final_hidden_states
+ 
+     @override
+@@ -478,7 +629,11 @@ class BlockSparseMLP_CPU:
+         self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
+             and not self.tid2eid_key
+         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
+-        if stats_path and self._split_dynamic:
++        if (
++            stats_path
++            and self._split_dynamic
++            and os.environ.get("EXL3_MOE_CPU_SWAP_PROFILE", "0") != "1"
++        ):
+             # Static placement from a stats file only applies with dynamic swapping disabled
+             print(f" !! {self.key}: EXL3_MOE_CPU_SPLIT_STATS ignored, set EXL3_MOE_CPU_SWAP=0 to use it")
+             stats_path = None
+@@ -489,7 +644,80 @@ class BlockSparseMLP_CPU:
+             import json
+             counts = json.load(open(stats_path)).get(self.key)
+             if counts is not None and len(counts) == self.num_experts:
+-                perm = sorted(range(self.num_experts), key = lambda e: -counts[e])
++                ranked = sorted(range(self.num_experts), key = lambda e: -counts[e])
++
++                # EXL3 experts do not necessarily occupy the same number of bytes. A pure
++                # frequency sort can therefore make the first `first` GPU slots larger than
++                # the identity layout and OOM an otherwise valid split. Keep the hot set
++                # within the original layout's expert-byte budget. CPU-tail aux tensors
++                # (suh/svh/bias) remain GPU-resident either way, so only budget the tensors
++                # that move with the full expert.
++                def gpu_extra_bytes(e):
++                    ls = ([self.gates[e]] if self.gated else []) + [self.ups[e], self.downs[e]]
++                    total = 0
++                    for linear in ls:
++                        full = sum(stc.get_tensor_sizes(linear.key))
++                        aux_b = sum(
++                            stc.get_tensor_size(linear.key + suffix, optional = True)
++                            for suffix in (".suh", ".svh", ".bias")
++                        )
++                        total += full - aux_b
++                    return total
++
++                sizes = [gpu_extra_bytes(e) for e in range(self.num_experts)]
++                ratio_env = "EXL3_MOE_MTP_PROFILE_BUDGET_RATIO" \
++                    if self.key.startswith("mtp.") else "EXL3_MOE_PROFILE_BUDGET_RATIO"
++                budget_ratio = float(os.environ.get(ratio_env, "1.0"))
++                minimum_bytes = sum(sorted(sizes)[:first])
++                byte_budget = max(int(sum(sizes[:first]) * budget_ratio), minimum_bytes)
++                hot = ranked[:first]
++                hot_bytes = sum(sizes[e] for e in hot)
++                if hot_bytes > byte_budget:
++                    # Lagrangian relaxation of cardinality-constrained knapsack: raise the
++                    # byte penalty until the chosen hot set fits, retaining the feasible set
++                    # with the most observed hits. This is deterministic and cheap at E=512.
++                    def choose(lam):
++                        return sorted(
++                            range(self.num_experts),
++                            key = lambda e: -(float(counts[e]) - lam * float(sizes[e])),
++                        )[:first]
++
++                    lo, hi = 0.0, 1.0
++                    for _ in range(64):
++                        if sum(sizes[e] for e in choose(hi)) <= byte_budget:
++                            break
++                        hi *= 2.0
++                    else:
++                        # Numerical fallback: the minimum-byte cardinality set is always
++                        # feasible because byte_budget is clamped to it above.
++                        hi = float("inf")
++                    best = choose(hi) if hi != float("inf") else sorted(
++                        range(self.num_experts), key = lambda e: sizes[e]
++                    )[:first]
++                    best_hits = sum(counts[e] for e in best)
++                    if hi != float("inf"):
++                        for _ in range(48):
++                            mid = (lo + hi) * 0.5
++                            candidate = choose(mid)
++                            candidate_bytes = sum(sizes[e] for e in candidate)
++                            if candidate_bytes <= byte_budget:
++                                hi = mid
++                                candidate_hits = sum(counts[e] for e in candidate)
++                                if candidate_hits > best_hits:
++                                    best, best_hits = candidate, candidate_hits
++                            else:
++                                lo = mid
++                    hot = sorted(best, key = lambda e: -counts[e])
++                if os.environ.get("EXL3_MOE_PROFILE_DEBUG"):
++                    print(
++                        f" -- profile budget {self.key}: "
++                        f"raw-hot {hot_bytes / 2**20:.1f} MiB, selected "
++                        f"{sum(sizes[e] for e in hot) / 2**20:.1f} MiB "
++                        f"(cap {byte_budget / 2**20:.1f} MiB, ratio {budget_ratio:.2f})",
++                        flush = True,
++                    )
++                hot_set = set(hot)
++                perm = hot + [e for e in ranked if e not in hot_set]
+                 self._split_perm = perm
+                 if self.gated:
+                     self.gates = [self.gates[e] for e in perm]
+@@ -500,6 +728,11 @@ class BlockSparseMLP_CPU:
+ 
+         self.device = torch.device(device)
+ 
++        # Runtime order may be frequency-permuted while _split_saved_lists remains in the
++        # original order for unload(). Dynamic profile adaptation must read replacement
++        # experts using the runtime order or router IDs would point at the wrong weights.
++        self._split_runtime_lists = (self.gates, self.ups, self.downs)
++
+         from ..model.moe_cpu_host import MoeCpuHost
+         comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
+         hosts = getattr(self.config, "moe_cpu_hosts", None)
+@@ -548,6 +781,74 @@ class BlockSparseMLP_CPU:
+             aux = aux,
+         )
+ 
++        # Optional single-layer peer-GPU shard. Reuse the normal BlockSparseMLP fused
++        # decode kernel on the remote device, but omit routing/shared/norm modules: the
++        # parent computes routing once and supplies the selected ids and weights. These
++        # experts remain present in the CPU worker's arena as the authoritative RAM copy,
++        # while _split_translate masks their requests so they are never double-counted.
++        peer_n = min(int(getattr(self, "_peer_requested_count", 0)), split_k)
++        if peer_n:
++            assert not self._split_dynamic, "peer canary currently requires static placement"
++            peer_device = torch.device("cuda", 1 - self.device.index)
++            peer = type(self)(
++                config = self.config,
++                key = self.key + ".peer",
++                hidden_size = self.hidden_size,
++                latent_size = self.latent_size,
++                intermediate_size = self.intermediate_size,
++                num_experts = self.num_experts,
++                num_experts_per_tok = self.num_experts_per_tok,
++                num_local_experts = peer_n,
++                activation_fn = self.activation_fn,
++                act_limit = self.act_limit,
++                interm_dtype = self.interm_dtype,
++                interm_div = self.interm_div,
++                router_type = self.router_type,
++                routed_scaling_factor = self.routed_scaling_factor,
++                n_group = self.n_group,
++                topk_group = self.topk_group,
++                gates = self.gates[first:first + peer_n] if self.gated else [],
++                ups = self.ups[first:first + peer_n],
++                downs = self.downs[first:first + peer_n],
++                routing_first = first,
++                routing_last = first + peer_n,
++            )
++            peer.device = peer_device
++            # Imported/sharded BlockSparseMLP instances receive existing Linear objects;
++            # the constructor intentionally does not re-register those in `modules`.
++            # This in-process canary owns their load/unload lifecycle explicitly.
++            peer.modules = peer.gates + peer.ups + peer.downs
++            for module in peer.modules:
++                module.load(peer_device, **kwargs)
++            peer.load_local(**kwargs)
++            if peer.bc is None:
++                qtypes = sorted({getattr(x, "quant_type", None) for x in peer.ups})
++                raise RuntimeError(
++                    f"peer shard fused backend unavailable for {self.key}: "
++                    f"qtypes={qtypes}, quantized={peer.is_quantized}, "
++                    f"support_quant={peer.support_quant_paths}, "
++                    f"support_bszn={peer.support_bc_bszn}, "
++                    f"no_reconstruct={self.config.infer_params.no_reconstruct}"
++                )
++            # Dedicated remote stream and persistent transfer buffers. The source stream
++            # only waits at the final additive merge, allowing the local GPU expert kernel
++            # and CPU partial to overlap the peer copy/compute/copy chain.
++            peer._peer_stream = torch.cuda.Stream(device = peer_device)
++            peer._peer_source_ready = torch.cuda.Event()
++            peer._peer_done = torch.cuda.Event()
++            peer._peer_y = torch.empty(
++                (8, self.expert_size), dtype = torch.half, device = peer_device)
++            peer._peer_selected = torch.empty(
++                (8, self.num_experts_per_tok), dtype = torch.long, device = peer_device)
++            peer._peer_weights = torch.empty(
++                (8, self.num_experts_per_tok), dtype = torch.half, device = peer_device)
++            peer._peer_return = torch.empty(
++                (8, self.expert_size), dtype = torch.float, device = self.device)
++            self._peer_shard = peer
++            print(
++                f" -- peer expert shard: {self.key} [{first}..{first + peer_n}) "
++                f"{self.device} -> {peer_device}", flush = True)
++
+         # Shrink to the GPU slice. The tail Linears leave the module tree entirely (never
+         # loaded); unload() restores them so a reload can redo the split cleanly
+         tail = set((self.gates[first:] if self.gated else []) + self.ups[first:] + self.downs[first:])
+@@ -707,5 +1008,7 @@ class BlockSparseMLP_CPU:
+         return True
+ 
+     def _split_saved_lists_ref(self):
++        if hasattr(self, "_split_runtime_lists"):
++            return self._split_runtime_lists
+         g, u, d = self._split_saved[0], self._split_saved[1], self._split_saved[2]
+         return g, u, d
+diff --git a/exllamav3/modules/moe_trace.py b/exllamav3/modules/moe_trace.py
+new file mode 100644
+index 0000000..e84a2ce
+--- /dev/null
++++ b/exllamav3/modules/moe_trace.py
+@@ -0,0 +1,110 @@
++"""Low-overhead routing trace for split CPU/GPU MoE experiments.
++
++The hot path only copies the router selections into a preallocated CUDA tensor.  Host
++synchronization, JSON serialization and cache-policy analysis happen after the generator
++queue drains.  Nothing is enabled unless EXL3_MOE_TRACE_PATH is set.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import time
++from pathlib import Path
++
++import torch
++
++
++TRACE_PATH = os.environ.get("EXL3_MOE_TRACE_PATH")
++TRACE_ROWS = max(1, int(os.environ.get("EXL3_MOE_TRACE_ROWS", "8192")))
++TRACE_MAX_BSZ = max(1, int(os.environ.get("EXL3_MOE_TRACE_MAX_BSZ", "8")))
++
++
++def init_moe_trace(module) -> None:
++    if (
++        not TRACE_PATH
++        or module.cpu_split_first is None
++        or getattr(module, "_moe_trace_registered", False)
++    ):
++        return
++    top_k = int(module.num_experts_per_tok)
++    module._moe_trace_selected = torch.empty(
++        (TRACE_ROWS, top_k), dtype=torch.int16, device=module.device
++    )
++    module._moe_trace_rows = 0
++    module._moe_trace_dropped = 0
++    module._moe_trace_registered = True
++    ip = module.config.infer_params
++    registry = getattr(ip, "moe_trace_modules", None)
++    if registry is None:
++        registry = []
++        ip.moe_trace_modules = registry
++        ip.moe_trace_sequence = 0
++    registry.append(module)
++
++
++def record_moe_trace(module, selected_experts: torch.Tensor, bsz: int) -> None:
++    buf = getattr(module, "_moe_trace_selected", None)
++    selected = selected_experts.reshape(-1, selected_experts.shape[-1])
++    if buf is None or bsz > TRACE_MAX_BSZ or selected.shape[0] > TRACE_MAX_BSZ:
++        return
++    start = int(module._moe_trace_rows)
++    take = min(int(selected.shape[0]), int(buf.shape[0]) - start)
++    if take > 0:
++        # copy_ performs the int64 -> int16 conversion on the current CUDA stream and does
++        # not synchronize with the host. Qwen3.8 has 512 experts, well inside int16.
++        buf[start:start + take].copy_(selected[:take], non_blocking=True)
++        module._moe_trace_rows = start + take
++    module._moe_trace_dropped += int(selected.shape[0]) - take
++
++
++def flush_moe_trace(infer_params) -> None:
++    if not TRACE_PATH:
++        return
++    registry = getattr(infer_params, "moe_trace_modules", None)
++    if not registry:
++        return
++    seen = set()
++    active = []
++    for module in registry:
++        if id(module) in seen or not getattr(module, "_moe_trace_rows", 0):
++            continue
++        seen.add(id(module))
++        active.append(module)
++    if not active:
++        return
++
++    for device_idx in sorted({int(m.device.index) for m in active}):
++        torch.cuda.synchronize(device_idx)
++
++    path = Path(TRACE_PATH)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    seq = int(getattr(infer_params, "moe_trace_sequence", 0))
++    infer_params.moe_trace_sequence = seq + 1
++    stamp = time.time_ns()
++
++    with path.open("a", encoding="utf-8") as f:
++        for module in active:
++            rows = int(module._moe_trace_rows)
++            placement = getattr(module, "_split_map", None)
++            if placement is None:
++                placement_ids = list(range(int(module.num_experts)))
++            else:
++                placement_ids = placement.detach().cpu().tolist()
++            record = {
++                "schema": 1,
++                "sequence": seq,
++                "time_ns": stamp,
++                "module": module.key,
++                "device": int(module.device.index),
++                "num_experts": int(module.num_experts),
++                "top_k": int(module.num_experts_per_tok),
++                "gpu_slots": int(module.cpu_split_first),
++                "rows": rows,
++                "dropped": int(module._moe_trace_dropped),
++                "placement": placement_ids,
++                "selected": module._moe_trace_selected[:rows].cpu().tolist(),
++            }
++            f.write(json.dumps(record, separators=(",", ":")) + "\n")
++            module._moe_trace_rows = 0
++            module._moe_trace_dropped = 0
