@@ -4,8 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string]$ModelRoot,
     [string]$ModelName = "Qwen3.8-Flash-Next-EXL3-4.05bpw",
     [int]$Port = 5002,
-    [int]$ContextTokens = 65536,
-    [int]$CpuExperts = 356,
+    [int]$ContextTokens = 98304,
+    [int]$CpuExperts = 364,
     [int]$CpuThreads = 16,
     [double[]]$GpuSplit = @(14.5, 14.5),
     [int]$ReasoningBudget = 1024,
@@ -21,7 +21,7 @@ $ModelRoot = (Resolve-Path -LiteralPath $ModelRoot).Path
 
 $python = Join-Path $TabbyApiRoot ".venv\Scripts\python.exe"
 $main = Join-Path $TabbyApiRoot "main.py"
-$templatePath = Join-Path $repoRoot "configs\tabbyapi-64k-thinking.yml.template"
+$templatePath = Join-Path $repoRoot "configs\tabbyapi-96k-thinking.yml.template"
 if (!(Test-Path -LiteralPath $python)) { throw "TabbyAPI venv Python not found: $python" }
 if (!(Test-Path -LiteralPath $main)) { throw "TabbyAPI main.py not found: $main" }
 if (!(Test-Path -LiteralPath (Join-Path $ExllamaRoot "exllamav3"))) {
@@ -76,6 +76,8 @@ $env:EXL3_MOE_CPU_SWAP_PROFILE = "1"
 $env:EXL3_MOE_CPU_SWAP_INTERVAL = "128"
 $env:EXL3_MOE_CPU_SWAP_MAX = "96"
 $env:EXL3_MOE_CPU_SWAP_PER_LAYER = "2"
+$env:EXL3_INT8_GEMV = "0"
+Remove-Item Env:EXL3_MOE_COOP_WIDE -ErrorAction SilentlyContinue
 
 try {
     Push-Location $TabbyApiRoot

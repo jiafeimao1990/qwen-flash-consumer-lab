@@ -1,0 +1,26 @@
+{
+  "date": "2026-09-19",
+  "hardware": "Ryzen 9 9950X, 128GB DDR5-6000, 2x RTX 5060 Ti 16GB",
+  "model": "Qwen3.8-Flash-Next-EXL3-4.05bpw",
+  "context_tokens": 98304,
+  "cache_mode": "Q4",
+  "gpu_experts_per_layer": 148,
+  "cpu_experts_per_layer": 364,
+  "mtp_draft_tokens": 3,
+  "short_decode_tok_s": [45.4, 41.4, 44.9, 52.7],
+  "short_decode_mean_tok_s": 46.1,
+  "same_machine_64k_control_tok_s": [43.0, 41.7, 47.0, 54.7],
+  "same_machine_64k_control_mean_tok_s": 46.6,
+  "relative_change_pct": -1.1,
+  "long_prompt": {
+    "prompt_tokens": 70019,
+    "new_prompt_tokens": 70019,
+    "prefill_tok_s": 1154,
+    "ttft_s": 60.7,
+    "output_tokens": 2,
+    "answer": "OK"
+  },
+  "gpu_free_mib_after_load": [700, 2719],
+  "gpu_free_mib_after_70k_prompt": [322, 1367],
+  "decision": "96K selected as default; decode regression was about 1.1%, long-prompt validation passed without OOM"
+}

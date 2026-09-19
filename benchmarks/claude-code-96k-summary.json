@@ -1,0 +1,27 @@
+{
+  "date": "2026-09-19",
+  "context_tokens": 98304,
+  "max_output_tokens": 8192,
+  "autocompact_pct": 72,
+  "warm_long_turns": {
+    "wall_output_tok_s_range": [33.5, 41.8],
+    "weighted_wall_output_tok_s": 38.8
+  },
+  "warm_large_turn": {
+    "input_tokens": 68635,
+    "prefix_cache_hit_pct": 97.7,
+    "output_tokens": 5745,
+    "elapsed_s": 145.0,
+    "wall_output_tok_s": 39.6
+  },
+  "cold_post_compaction_turn": {
+    "input_tokens": 48730,
+    "prefix_cache_hit_pct": 0.0,
+    "output_tokens": 1340,
+    "elapsed_s": 89.6,
+    "apparent_wall_output_tok_s": 15.0,
+    "interpretation": "Cold prefill dominated wall time; this is not decode throughput."
+  },
+  "normal_warm_prefix_cache_pct_range": [96, 99],
+  "decision": "Backend decode approaches 48 tok/s in a fixed test, while a real warm Claude Code tool chain is typically around 39-42 tok/s."
+}

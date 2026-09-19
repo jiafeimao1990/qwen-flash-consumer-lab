@@ -1,9 +1,9 @@
 # Architecture
 
-Qwen3.8-Flash-Next has 512 routed experts in each of 48 MoE layers. The tested
-profile keeps attention, recurrent components and 156 routed experts per layer
-on the two GPUs. The other 356 routed experts remain in system memory and use
-ExLlamaV3's CPU MoE path.
+Qwen3.8-Flash-Next has 512 routed experts in each of 48 MoE layers. The current
+96K profile keeps attention, recurrent components and 148 routed experts per
+layer on the two GPUs. The other 364 routed experts remain in system memory
+and use ExLlamaV3's CPU MoE path.
 
 The patch adds four layers around that upstream path:
 

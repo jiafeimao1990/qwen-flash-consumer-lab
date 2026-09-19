@@ -2,7 +2,7 @@
   "hardware": {
     "cpu": "Ryzen 9 9950X",
     "system_memory_gib": 127.7,
-    "memory_speed": "DDR5-5200",
+    "memory_speed": "DDR5-6000 (latest 96K and tuning pass; earlier experiments used DDR5-5200)",
     "gpus": [
       "RTX 5060 Ti 16GB",
       "RTX 5060 Ti 16GB"
@@ -10,15 +10,17 @@
   },
   "configuration": {
     "model": "Qwen3.8-Flash-Next-EXL3-4.05bpw",
-    "context_tokens": 65536,
+    "context_tokens": 98304,
     "kv_cache": "Q4",
     "gpu_split_gib": [14.5, 14.5],
-    "cpu_experts_per_layer": 356,
+    "cpu_experts_per_layer": 364,
     "cpu_threads": 16,
     "chunk_size": 4096,
     "mtp_draft_tokens": 3,
     "reasoning_budget_tokens": 1024,
-    "thinking_enabled": true
+    "thinking_enabled": true,
+    "int8_gemv": 0,
+    "moe_coop_wide": "auto"
   },
   "controlled_no_mtp_tok_s": {
     "identity": [23.2, 24.3],
@@ -119,7 +121,42 @@
     "followup_prefix_cache_pct": [71, 97, 96],
     "decision": "passed; real DeepSeek Harness file-write and test workflow completed without intervention"
   },
-  "resident_memory_after_load": {
+  "context_96k_trial": {
+    "gpu_experts_per_layer": 148,
+    "cpu_experts_per_layer": 364,
+    "short_decode_tok_s": [45.4, 41.4, 44.9, 52.7],
+    "short_decode_mean_tok_s": 46.1,
+    "same_boot_64k_mean_tok_s": 46.6,
+    "relative_change_pct": -1.1,
+    "long_prompt_tokens": 70019,
+    "long_prompt_prefill_tok_s": 1154,
+    "long_prompt_ttft_s": 60.7,
+    "gpu_free_mib_after_long_prompt": [322, 1367],
+    "decision": "96K selected as current default"
+  },
+  "tuning_96k": {
+    "fixed_512_tok_s": 47.825,
+    "fixed_512_int8_mode_2_tok_s": 47.6,
+    "draft_3_mean_tok_s": 46.675,
+    "draft_4_mean_tok_s": 42.55,
+    "draft_5_mean_tok_s": 46.725,
+    "draft_3_accept_pct": 84.37,
+    "draft_5_accept_pct": 72.19,
+    "selected_cpu_threads": 16,
+    "selected_int8_gemv": 0,
+    "selected_moe_coop_wide": "auto"
+  },
+  "claude_code_96k": {
+    "warm_long_turn_wall_tok_s_range": [33.5, 41.8],
+    "warm_long_turn_weighted_wall_tok_s": 38.8,
+    "large_warm_input_tokens": 68635,
+    "large_warm_prefix_cache_pct": 97.7,
+    "large_warm_output_tokens": 5745,
+    "large_warm_elapsed_s": 145.0,
+    "large_warm_wall_tok_s": 39.6,
+    "normal_warm_prefix_cache_pct_range": [96, 99]
+  },
+  "resident_memory_after_load_64k": {
     "gpu0_mib": 15813,
     "gpu1_mib": 14272,
     "system_free_gib": 65.6

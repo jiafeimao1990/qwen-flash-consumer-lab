@@ -43,3 +43,52 @@ also introduced a scalar GPU-to-host synchronization and sometimes computed an
 expert that was not selected. Mean decode regressed from 26.85 to 25.28 tok/s.
 
 Machine-readable values are in `benchmarks/benchmark-summary.json`.
+
+## Selected: 96K Q4 cache
+
+The latest profile moved another eight routed experts per layer to CPU, leaving
+148 GPU-resident and 364 CPU-resident routed experts. On the same boot, four
+matched short coding requests averaged 46.1 tok/s at 96K versus 46.6 tok/s at
+64K, a 1.1% difference. A 70,019-token cold prompt completed at 1,154 prompt
+tok/s with 60.7 seconds to first token and returned the expected result.
+
+After that long prompt, reported free VRAM was approximately 322 MiB on GPU0
+and 1,367 MiB on GPU1. The profile is therefore validated on the reference
+machine but has little margin for unrelated GPU users. See
+`benchmarks/context-96k-trial.json`.
+
+## Kernel, MTP and CPU-worker matrix
+
+The 96K profile was exercised across activation GEMV modes 0/1/2, automatic
+and forced MoE tile selection, MTP draft ceilings 3/4/5, and 8/12/16/20 CPU
+workers. Important results:
+
+- Forced wide or narrow MoE tiles did not beat automatic selection in a
+  fixed-seed confirmation.
+- Draft 4 averaged 42.55 tok/s and regressed clearly. Draft 5 tied draft 3 in
+  one short matrix but had lower acceptance (72.19% versus 84.37%) and no
+  reliable advantage.
+- Eight and twenty CPU workers were slower. A final 512-token confirmation
+  measured 47.83 tok/s with 16 workers versus 46.08 with 12.
+- INT8 GEMV mode 2 measured 47.60 tok/s in the final 512-token comparison,
+  versus 47.83 with it disabled. The default therefore uses
+  `EXL3_INT8_GEMV=0` and avoids a small activation approximation without
+  giving up measured speed.
+
+The selected default remains dynamic MTP with a ceiling of three draft tokens,
+16 CPU workers and automatic MoE tile selection. Aggregate values are in
+`benchmarks/tuning-matrix-summary.json`; per-case values are in
+`benchmarks/tuning-matrix-raw.jsonl`.
+
+## Claude Code: backend speed versus agent speed
+
+Warm long Claude Code turns measured 33.5-41.8 output tok/s and 38.8 tok/s as
+a weighted wall-rate mean. A large warm turn with 68,635 input tokens reused
+97.7% of its prefix and emitted 5,745 tokens in 145 seconds (39.6 output
+tok/s). A cold post-compaction turn looked much slower because it had to
+prefill 48,730 uncached input tokens.
+
+This distinction matters: the fixed backend benchmark can approach 48 tok/s,
+but a real agent loop includes prefill, gateway work, tool execution and short
+generations. The aggregate measurements and compaction policy are documented
+in `benchmarks/claude-code-96k-summary.json` and `docs/CLAUDE_CODE.md`.

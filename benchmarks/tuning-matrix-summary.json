@@ -1,0 +1,49 @@
+{
+  "date": "2026-09-19",
+  "profile": "96K Q4 KV, 148 GPU experts per layer, dynamic MTP",
+  "kernel_matrix": {
+    "int8_0_wide_auto_mean_tok_s": 46.425,
+    "int8_0_wide_0_mean_tok_s": 45.9,
+    "int8_0_wide_1_mean_tok_s": 46.3,
+    "int8_1_wide_auto_mean_tok_s": 45.625,
+    "int8_1_wide_0_mean_tok_s": 47.0,
+    "int8_1_wide_1_mean_tok_s": 46.5,
+    "int8_2_wide_auto_mean_tok_s": 46.45,
+    "int8_2_wide_0_mean_tok_s": 46.4,
+    "int8_2_wide_1_mean_tok_s": 45.125,
+    "fixed_seed_confirmation": {
+      "int8_0_wide_auto": 46.175,
+      "int8_1_wide_0": 44.35,
+      "int8_2_wide_auto": 45.85
+    }
+  },
+  "draft_matrix": {
+    "draft_3_mean_tok_s": 46.675,
+    "draft_3_accept_pct": 84.37,
+    "draft_4_mean_tok_s": 42.55,
+    "draft_4_accept_pct": 75.67,
+    "draft_5_mean_tok_s": 46.725,
+    "draft_5_accept_pct": 72.19
+  },
+  "thread_matrix": {
+    "threads_8_mean_tok_s": 43.3,
+    "threads_12_mean_tok_s": 46.425,
+    "threads_16_mean_tok_s": 46.175,
+    "threads_20_mean_tok_s": 42.925,
+    "greedy_512_final": {
+      "threads_12_mean_tok_s": 46.075,
+      "threads_16_mean_tok_s": 47.825
+    }
+  },
+  "final_int8_512_comparison": {
+    "int8_0_threads_16_mean_tok_s": 47.825,
+    "int8_2_threads_16_mean_tok_s": 47.6
+  },
+  "selected": {
+    "EXL3_INT8_GEMV": 0,
+    "EXL3_MOE_COOP_WIDE": "auto",
+    "draft_num_tokens": 3,
+    "dynamic_draft": true,
+    "cpu_moe_threads": 16
+  }
+}

@@ -2,7 +2,7 @@
 
 Reproducible Windows experiments for running **Qwen3.8-Flash-Next EXL3** on
 two 16 GB consumer NVIDIA GPUs with CPU/GPU expert splitting, workload-aware
-expert placement, MTP, 64K context and real agent-tool validation.
+expert placement, MTP, 96K context and real agent-tool validation.
 
 > This is not a new inference engine. It is an independently developed patch,
 > profiler, launch profile and benchmark suite built on ExLlamaV3 v1.5.0.
@@ -13,7 +13,8 @@ Reference machine:
 
 - Windows 11
 - Ryzen 9 9950X
-- 128 GB DDR5-5200
+- 128 GB DDR5-6000 for the latest 96K/tuning pass (earlier 64K work used
+  DDR5-5200)
 - 2 × RTX 5060 Ti 16 GB, no NVLink
 - Qwen3.8-Flash-Next EXL3 4.05 bpw
 
@@ -21,24 +22,29 @@ Stable profile:
 
 | Setting | Value |
 |---|---:|
-| Context | 65,536 tokens |
+| Context | 98,304 tokens |
 | KV cache | Q4 |
 | GPU budget | 14.5 + 14.5 GiB |
-| GPU-resident routed experts | 156 per layer |
-| CPU routed experts | 356 per layer |
+| GPU-resident routed experts | 148 per layer |
+| CPU routed experts | 364 per layer |
 | CPU workers | 16 |
 | MTP | dynamic, draft ceiling 3 |
 | Reasoning budget | 1,024 tokens |
+| INT8 activation GEMV | disabled after A/B testing |
 
 Measured results:
 
 | Workload | Result |
 |---|---:|
-| Four warm coding prompts | 47.25 tok/s mean |
+| Fixed 512-token coding benchmark | 47.83 tok/s mean |
+| 96K vs same-boot 64K short decode | 46.1 vs 46.6 tok/s (-1.1%) |
+| 70,019-token cold prefill | 1,154 tok/s; 60.7 s TTFT |
 | DeepSeek Harness tool task | 38.3–40.4 tok/s decode |
 | Harness initial 8,037-token prefill | 721 tok/s |
 | Harness prefix reuse | 71–97% |
 | Harness quality check | 10/10 independent tests passed |
+| Claude Code warm long turns | 38.8 tok/s weighted wall rate |
+| Claude Code 68,635-token warm turn | 39.6 tok/s; 97.7% prefix reuse |
 
 The Harness task created a dependency-free Python CLI, wrote its tests, ran
 them and completed a manual smoke test without intervention. Raw structured
@@ -101,18 +107,23 @@ cd qwen-flash-consumer-lab
 ```
 
 Use `-Port`, `-ContextTokens`, `-CpuExperts`, `-CpuThreads` and `-GpuSplit`
-to adapt the profile. The 64K defaults are specific to two 16 GB cards; start
+to adapt the profile. The 96K defaults are specific to two 16 GB cards; start
 more conservatively on different hardware.
 
 Add `-DryRun` to render and inspect the generated TabbyAPI configuration
 without starting a server.
 
-## llama-swap and Harness
+## llama-swap, Harness and Claude Code
 
 The examples in [`integrations/`](integrations/) contain placeholders rather
 than machine-specific paths. Add the llama-swap model block to your own config,
 then add the Harness provider block to your settings. Both route through the
 model ID `qwen3.8-flash-next-exl3`.
+
+Claude Code was also exercised through a local Anthropic-to-OpenAI compatibility
+gateway. The context/output/compaction environment values used for that test
+are documented in [`docs/CLAUDE_CODE.md`](docs/CLAUDE_CODE.md). A running
+Claude process must be restarted after those environment values change.
 
 ## Rebuilding a workload profile
 
@@ -131,6 +142,8 @@ depends on prompt language and workload.
 - Tested on one Windows dual-5060-Ti system; outside results are welcome.
 - Text and tool use were tested. Vision is disabled and not claimed.
 - The 4.05-bpw model and 128 GB RAM were used for the published result.
+- 96K leaves little headroom on the fuller GPU after a 70K prompt; the tested
+  free-VRAM floor was roughly 322 MiB, so this is not a universal safe default.
 - The patch is pinned to ExLlamaV3 v1.5.0 and may need rebasing for newer tags.
 - Experimental peer/prefetch paths are opt-in and are not recommended defaults.
 
